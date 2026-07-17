@@ -4,7 +4,7 @@ from typing import Annotated
 import numpy as np
 import pickle
 import os
-import shap  # OPSI 3: wrapper black-box (lihat lifespan & _explain_single)
+import shap  # OPSI 1: GradientExplainer per model
 from collections import defaultdict
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -27,6 +27,8 @@ MODEL_GRU      = os.path.join(BASE_DIR, "src", "models",    "best_model_gru.kera
 MODEL_CNN      = os.path.join(BASE_DIR, "src", "models",    "best_model_cnn_bilstm.keras")
 TOKENIZER_PATH = os.path.join(BASE_DIR, "src", "tokenizer", "tokenizer.pkl")
 TFIDF_PATH     = os.path.join(BASE_DIR, "src", "tokenizer", "tfidf_vectorizer.pkl")
+BACKGROUND_PATH = os.path.join(BASE_DIR, "src", "tokenizer", "background_samples.pkl")
+BACKGROUND_SIZE = 50  # jumlah sampel background yang dipakai (trade-off akurasi vs kecepatan)
 
 MAX_LEN_BILSTM = 200
 MAX_LEN_GRU    = 250
@@ -86,6 +88,48 @@ def _get_embedding_vocab_size(model: tf.keras.Model) -> int:
     return 50000  
 
 
+def _embedding_layer(model: tf.keras.Model) -> tf.keras.layers.Layer:
+    """Cari layer Embedding pertama di model. Dipakai untuk memotong model
+    jadi dua bagian saat setup GradientExplainer (lihat _build_embedding_submodels)."""
+    for layer in model.layers:
+        if "embedding" in layer.name.lower():
+            return layer
+    raise ValueError(f"Tidak ditemukan layer Embedding di model '{model.name}'.")
+
+
+def _build_embedding_submodels(
+    model: tf.keras.Model, extra_inputs: list | None = None
+) -> tuple[tf.keras.Model, tf.keras.Model]:
+    """
+    ROOT CAUSE FIX untuk error "zero-dimensional arrays cannot be concatenated":
+    GradientExplainer butuh gradien output model terhadap INPUT model. Tapi input
+    model kita adalah index integer hasil tokenizer — index integer tidak punya
+    gradien (cuma dipakai untuk lookup di layer Embedding), jadi tf.GradientTape
+    mengembalikan None, lalu shap mencoba np.concatenate(None, ...) dan meledak.
+    Ini bug/limitasi shap yang sudah lama dilaporkan (shap issue #965, #496,
+    #1119) dan TIDAK bisa diperbaiki dengan gonta-ganti versi numpy/shap.
+
+    Fix-nya: jangan explain dari input integer, tapi dari OUTPUT layer Embedding
+    (berupa vektor float, punya gradien). Makanya model dipecah jadi dua:
+      - embed_model      : input token index (int)      -> vektor embedding (float)
+      - post_embed_model : vektor embedding (+extra_inputs) -> prediksi akhir
+    GradientExplainer dijalankan di post_embed_model, dengan background data
+    berupa hasil embed_model.predict(...), bukan sequence mentah.
+
+    extra_inputs: tensor input lain yang ikut dipertahankan apa adanya di
+    post_embed_model (dipakai untuk cabang TF-IDF di model CNN hybrid, yang
+    memang sudah berupa angka float sehingga punya gradien dan tidak perlu
+    "dipotong" seperti cabang sequence).
+    """
+    embed_layer = _embedding_layer(model)
+    embed_model = tf.keras.Model(inputs=embed_layer.input, outputs=embed_layer.output)
+
+    post_inputs = [embed_layer.output] + (extra_inputs or [])
+    post_embed_model = tf.keras.Model(inputs=post_inputs, outputs=model.output)
+
+    return embed_model, post_embed_model
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _check_files()
@@ -113,34 +157,60 @@ async def lifespan(app: FastAPI):
 
     print("✅ Semua model & vectorizer berhasil dimuat.")
 
-    # ── PIVOT KE OPSI 3: wrapper black-box (bukan lagi DeepExplainer/GradientExplainer) ──
-    # Setelah 2x percobaan (DeepExplainer, lalu GradientExplainer) tetap gagal
-    # karena ketidakcocokan gradien custom AttentionLayer dengan TF2 di environment
-    # ini, pindah ke pendekatan yang SAMA SEKALI TIDAK menyentuh gradien model.
-    # shap.Explainer dengan Text masker cukup memanggil model.predict() berkali-kali
-    # (persis seperti endpoint /predict yang sudah terbukti jalan normal), jadi
-    # kelas bug gradien ini otomatis tidak relevan lagi.
-    #
-    # Bonus: karena caranya cuma manggil predict() pada teks yang diubah-ubah
-    # (bukan berdasarkan baseline numerik), background_samples.pkl JADI TIDAK
-    # DIPERLUKAN lagi untuk pendekatan ini.
-    def _ensemble_predict_fn(texts: list[str]) -> np.ndarray:
-        """Fungsi predict() gabungan ensemble, dipakai sebagai 'kotak hitam' oleh SHAP."""
-        probs = []
-        for t in texts:
-            p_bilstm, p_gru, p_cnn = _predict_single(t)
-            probs.append(np.mean([p_bilstm, p_gru, p_cnn]))
-        return np.array(probs)
+    # ── OPSI 1: Setup GradientExplainer per model ──────────────────────────
+    # index_to_word dipakai untuk translate hasil SHAP (berbasis index integer)
+    # balik ke kata asli. Karena di sini cuma ADA SATU tokenizer yang dipakai
+    # bareng oleh ketiga model, index->kata ini juga cuma perlu dibuat SEKALI.
+    app_state["index_to_word"] = {
+        idx: word for word, idx in app_state["tokenizer"].word_index.items()
+    }
+    app_state["tfidf_feature_names"] = app_state["tfidf"].get_feature_names_out()
 
-    app_state["explain_fn"] = _ensemble_predict_fn
-    # Text masker default SHAP memecah kata pakai regex yang menganggap tanda
-    # hubung (-) sebagai pemisah — bikin "COVID-19" jadi "COVID-"+"19",
-    # "diam-diam" jadi "diam"+"diam-". Pakai tokenizer regex \S+ (pisah
-    # cuma berdasarkan spasi) supaya kata dengan tanda hubung tetap utuh.
-    app_state["explainer"] = shap.Explainer(
-        _ensemble_predict_fn, shap.maskers.Text(r"\S+")
-    )
-    print("🔍 SHAP wrapper explainer siap (black-box, tanpa gradien).")
+    app_state["explainers"] = {}
+    app_state["embed_models"] = {}
+    if os.path.exists(BACKGROUND_PATH):
+        with open(BACKGROUND_PATH, "rb") as f:
+            background_texts = pickle.load(f)[:BACKGROUND_SIZE]
+
+        bg_bilstm = _pad(background_texts, MAX_LEN_BILSTM, VOCAB_SIZE["bilstm"])
+        bg_gru    = _pad(background_texts, MAX_LEN_GRU,    VOCAB_SIZE["gru"])
+        bg_cnn    = _pad(background_texts, MAX_LEN_CNN,    VOCAB_SIZE["cnn"])
+        bg_tfidf  = app_state["tfidf"].transform(background_texts).toarray().astype(np.float32)
+
+        # OPSI 1 — GradientExplainer dijalankan di post_embed_model (lihat
+        # _build_embedding_submodels), BUKAN di model asli. Ini fix untuk error
+        # "zero-dimensional arrays cannot be concatenated" yang akar masalahnya
+        # adalah gradien None dari layer Embedding terhadap input integer
+        # (shap issue #965) — bukan soal versi numpy/shap yang bentrok.
+
+        embed_bilstm, post_bilstm = _build_embedding_submodels(app_state["bilstm"])
+        bg_embed_bilstm = embed_bilstm.predict(bg_bilstm, verbose=0)
+        app_state["explainers"]["bilstm"] = shap.GradientExplainer(post_bilstm, bg_embed_bilstm)
+        app_state["embed_models"]["bilstm"] = embed_bilstm
+
+        embed_gru, post_gru = _build_embedding_submodels(app_state["gru"])
+        bg_embed_gru = embed_gru.predict(bg_gru, verbose=0)
+        app_state["explainers"]["gru"] = shap.GradientExplainer(post_gru, bg_embed_gru)
+        app_state["embed_models"]["gru"] = embed_gru
+
+        # Model CNN hybrid: cabang TF-IDF sudah berupa angka float (punya
+        # gradien), jadi cukup dipertahankan sebagai extra_inputs apa adanya —
+        # yang perlu "dipotong" cuma cabang sequence-nya.
+        # CATATAN: nama layer Input untuk cabang TF-IDF diasumsikan "input_tfidf"
+        # (sesuai key dict yang dipakai di _predict_single/model.predict()).
+        # Kalau nama layer aslinya beda, sesuaikan string di get_layer() di bawah
+        # — cek dengan app_state["cnn"].summary() kalau terjadi KeyError di sini.
+        tfidf_input_tensor = app_state["cnn"].get_layer("input_tfidf").output
+        embed_cnn, post_cnn = _build_embedding_submodels(
+            app_state["cnn"], extra_inputs=[tfidf_input_tensor]
+        )
+        bg_embed_cnn = embed_cnn.predict(bg_cnn, verbose=0)
+        app_state["explainers"]["cnn"] = shap.GradientExplainer(post_cnn, [bg_embed_cnn, bg_tfidf])
+        app_state["embed_models"]["cnn"] = embed_cnn
+
+        print(f"🔍 GradientExplainer siap (background: {len(background_texts)} sampel).")
+    else:
+        print(f"⚠️  Background samples tidak ditemukan di {BACKGROUND_PATH} — /predict/explain nonaktif.")
 
     yield
     app_state.clear()
@@ -239,10 +309,24 @@ class VocabCheckResponse(BaseModel):
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def _pad(texts: list[str], maxlen: int, vocab_size: int) -> np.ndarray:
-    """Tokenize, pad, lalu clip index agar tidak melebihi vocab embedding."""
+    """Tokenize, pad, lalu clip index agar tidak melebihi vocab embedding.
+    PENTING: hasil clip ini cuma boleh dipakai untuk FEED ke model (embedding
+    lookup), JANGAN dipakai untuk translate index->kata (lihat _original_sequence)
+    — kalau index tokenizer aslinya > vocab_size-1, clip akan menggantinya jadi
+    index kata LAIN yang kebetulan menempati vocab_size-1, bukan kata aslinya."""
     sequences = app_state["tokenizer"].texts_to_sequences(texts)
     padded = pad_sequences(sequences, maxlen=maxlen, truncating="post", padding="post")
     return np.clip(padded, 0, vocab_size - 1)
+
+
+def _original_sequence(texts: list[str], maxlen: int) -> np.ndarray:
+    """Sequence tokenizer TANPA clip vocab_size — dipakai KHUSUS untuk translate
+    index->kata yang benar di /predict/explain. Model tetap di-feed pakai versi
+    ter-clip dari _pad(), tapi label kata di response harus pakai index asli ini,
+    supaya kata yang index-nya kebetulan > vocab_size model tidak salah nyasar
+    ke kata lain saat ditranslate index_to_word."""
+    sequences = app_state["tokenizer"].texts_to_sequences(texts)
+    return pad_sequences(sequences, maxlen=maxlen, truncating="post", padding="post")
 
 
 def _tfidf(texts: list[str]) -> np.ndarray:
@@ -288,37 +372,120 @@ def _build_response(text: str, p_bilstm: float, p_gru: float, p_cnn: float) -> P
     )
 
 
-# ─── OPSI 3: wrapper black-box helper ──────────────────────────────────────────
-def _explain_single(text: str) -> tuple[dict[str, float], float, float, float]:
-    """
-    Jalankan SHAP wrapper (black-box) pada satu teks. Berbeda dari pendekatan
-    gradien sebelumnya, di sini SHAP tidak pernah menyentuh index tokenizer,
-    embedding, atau gradien model sama sekali — dia cuma memanggil
-    _ensemble_predict_fn(list_teks) berkali-kali dengan variasi kata yang
-    dihapus/di-mask, lalu membandingkan perubahan probabilitasnya. Hasilnya
-    otomatis berupa skor PER KATA (bukan per index), jadi tidak perlu proses
-    translate atau gabung-3-model manual seperti pendekatan sebelumnya.
-    """
-    explainer = app_state.get("explainer")
-    if explainer is None:
-        raise RuntimeError("SHAP explainer belum siap.")
+# ─── OPSI 1: GradientExplainer helpers ─────────────────────────────────────────
+def _squeeze_shap_output(raw) -> np.ndarray:
+    """Normalisasi bentuk output shap_values() (beda-beda antar versi shap) jadi array 1D."""
+    arr = np.array(raw)
+    return arr.squeeze()
 
-    explanation = explainer([text], max_evals=500)  # naikkan dari default supaya skor lebih stabil
 
-    words = explanation.data[0]     # array kata hasil pemecahan teks oleh Text masker
-    scores = explanation.values[0]  # array skor SHAP, urutannya sejajar dengan `words`
+def _dup(arr: np.ndarray) -> np.ndarray:
+    """Workaround: sebagian versi shap error kalau dikasih batch size 1. Duplikasi jadi 2, ambil baris pertama nanti."""
+    return np.concatenate([arr, arr], axis=0)
 
-    merged_scores: dict[str, float] = defaultdict(float)
-    for word, score in zip(words, scores):
-        w = str(word).strip()
-        if not w:
+
+def _sequence_shap_to_words(shap_vals_seq: np.ndarray, padded_seq: np.ndarray, index_to_word: dict) -> dict[str, float]:
+    """Translate skor SHAP dari index tokenizer balik ke kata asli (index 0 = padding, dilewati)."""
+    scores: dict[str, float] = {}
+    seq = padded_seq.flatten()
+    for token_index, score in zip(seq, shap_vals_seq):
+        if token_index == 0:
             continue
-        merged_scores[w] += float(score)
+        word = index_to_word.get(int(token_index))
+        if word is None:
+            continue
+        scores[word] = scores.get(word, 0.0) + float(score)
+    return scores
 
-    # Prediksi label tetap pakai jalur predict biasa (bukan dari SHAP),
-    # supaya labelnya konsisten dengan endpoint /predict yang sudah ada.
+
+def _tfidf_shap_to_words(
+    shap_vals_tfidf: np.ndarray, tfidf_input_vec: np.ndarray, feature_names: np.ndarray
+) -> dict[str, float]:
+    """Translate skor SHAP dari kolom TF-IDF (khusus jalur hybrid CNN) balik ke
+    kata asli. HANYA kata yang benar-benar muncul di teks input (nilai TF-IDF
+    != 0) yang disertakan.
+
+    PENTING: filter-nya berdasarkan nilai TF-IDF INPUT (tfidf_input_vec), BUKAN
+    berdasarkan apakah skor SHAP-nya 0. SHAP menghitung kontribusi dibanding
+    rata-rata background, jadi kata yang TIDAK ADA di teks (tfidf=0) tetap bisa
+    dapat skor SHAP kecil non-zero (mencerminkan "ketiadaan kata ini dibanding
+    artikel rata-rata"). Itu valid secara matematis tapi tidak relevan untuk
+    highlight kata di artikel — makanya harus difilter dari sisi input, bukan
+    dari sisi skor.
+    """
+    scores: dict[str, float] = {}
+    for i, present in enumerate(tfidf_input_vec):
+        if present == 0:
+            continue
+        word = feature_names[i]
+        scores[word] = scores.get(word, 0.0) + float(shap_vals_tfidf[i])
+    return scores
+
+
+def _explain_single(text: str) -> tuple[dict[str, float], float, float, float]:
+    """Jalankan GradientExplainer untuk ketiga model, gabungkan (rata-rata) skor kata lintas model."""
+    explainers = app_state["explainers"]
+    if not explainers:
+        raise RuntimeError("GradientExplainer belum siap — background_samples.pkl tidak ditemukan saat startup.")
+
+    index_to_word = app_state["index_to_word"]
+    embed_models  = app_state["embed_models"]
+
+    pad_bilstm = _pad([text], MAX_LEN_BILSTM, VOCAB_SIZE["bilstm"])
+    pad_gru    = _pad([text], MAX_LEN_GRU,    VOCAB_SIZE["gru"])
+    pad_cnn    = _pad([text], MAX_LEN_CNN,    VOCAB_SIZE["cnn"])
+    tfidf_feat = _tfidf([text])
+
+    # Sequence ASLI (tanpa clip vocab_size) — dipakai KHUSUS untuk translate
+    # index->kata yang benar. pad_bilstm/pad_gru/pad_cnn (yang sudah di-clip)
+    # tetap dipakai untuk feed ke embed_models, karena itu yang sesuai dengan
+    # apa yang benar-benar "dilihat" model.
+    orig_bilstm = _original_sequence([text], MAX_LEN_BILSTM)
+    orig_gru    = _original_sequence([text], MAX_LEN_GRU)
+    orig_cnn    = _original_sequence([text], MAX_LEN_CNN)
+
+    # OPSI 1 fix: explainer jalan di ruang embedding (float), bukan di index
+    # integer mentah — makanya pad_* diubah dulu jadi vektor embedding lewat
+    # embed_models sebelum dilempar ke shap_values(). Hasilnya berbentuk
+    # (seq_len, embedding_dim) per sampel, jadi perlu di-sum di axis terakhir
+    # untuk dapat satu skor per posisi token (skor kontribusi token itu =
+    # total kontribusi semua dimensi vektor embedding-nya).
+    emb_bilstm = embed_models["bilstm"].predict(pad_bilstm, verbose=0)
+    sv_bilstm = _squeeze_shap_output(explainers["bilstm"].shap_values(_dup(emb_bilstm)))[0]
+    sv_bilstm = sv_bilstm.sum(axis=-1)
+    words_bilstm = _sequence_shap_to_words(sv_bilstm, orig_bilstm, index_to_word)
+
+    emb_gru = embed_models["gru"].predict(pad_gru, verbose=0)
+    sv_gru = _squeeze_shap_output(explainers["gru"].shap_values(_dup(emb_gru)))[0]
+    sv_gru = sv_gru.sum(axis=-1)
+    words_gru = _sequence_shap_to_words(sv_gru, orig_gru, index_to_word)
+
+    emb_cnn = embed_models["cnn"].predict(pad_cnn, verbose=0)
+    sv_cnn_seq, sv_cnn_tfidf = explainers["cnn"].shap_values([_dup(emb_cnn), _dup(tfidf_feat)])
+    sv_cnn_seq   = _squeeze_shap_output(sv_cnn_seq)[0]
+    sv_cnn_seq   = sv_cnn_seq.sum(axis=-1)
+    sv_cnn_tfidf = _squeeze_shap_output(sv_cnn_tfidf)[0]
+
+    words_cnn_seq   = _sequence_shap_to_words(sv_cnn_seq, orig_cnn, index_to_word)
+    words_cnn_tfidf = _tfidf_shap_to_words(sv_cnn_tfidf, tfidf_feat.flatten(), app_state["tfidf_feature_names"])
+
+    words_cnn: dict[str, float] = defaultdict(float)
+    for w, s in words_cnn_seq.items():
+        words_cnn[w] += s
+    for w, s in words_cnn_tfidf.items():
+        words_cnn[w] += s
+
+    totals: dict[str, float] = defaultdict(float)
+    counts: dict[str, int] = defaultdict(int)
+    for words in (words_bilstm, words_gru, words_cnn):
+        for w, s in words.items():
+            totals[w] += s
+            counts[w] += 1
+
+    merged_scores = {w: totals[w] / counts[w] for w in totals}
+
     p_bilstm, p_gru, p_cnn = _predict_single(text)
-    return dict(merged_scores), p_bilstm, p_gru, p_cnn
+    return merged_scores, p_bilstm, p_gru, p_cnn
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -363,17 +530,16 @@ def predict_batch(request: BatchPredictRequest):
 @app.post("/predict/explain", response_model=ExplainResponse, tags=["Explainability"])
 def predict_explain(request: PredictRequest):
     """
-    OPSI 3 — Prediksi + penjelasan XAI via SHAP wrapper black-box.
-    Ensemble (bilstm+gru+cnn) di-treat sebagai satu fungsi predict tunggal;
-    SHAP memperturbasi teks input (bukan gradien/index internal model) untuk
-    menghitung kontribusi tiap kata. Lebih berat secara komputasi dibanding
-    /predict biasa — cocok dipakai saat pengguna memang minta penjelasan,
-    bukan dipanggil di setiap prediksi.
+    OPSI 1 — Prediksi + penjelasan XAI via GradientExplainer per model.
+    Menjalankan SHAP GradientExplainer terpisah untuk bilstm, gru, dan cnn,
+    lalu menggabungkan skor kontribusi kata dari ketiganya. Lebih berat
+    secara komputasi dibanding /predict biasa — cocok dipakai saat pengguna
+    memang minta penjelasan, bukan dipanggil di setiap prediksi.
     """
-    if app_state.get("explainer") is None:
+    if not app_state.get("explainers"):
         raise HTTPException(
             status_code=503,
-            detail="Explainability belum aktif — explainer gagal dibuat saat startup.",
+            detail="Explainability belum aktif — background_samples.pkl tidak ditemukan saat startup.",
         )
     try:
         merged_scores, p_bilstm, p_gru, p_cnn = _explain_single(request.text)
