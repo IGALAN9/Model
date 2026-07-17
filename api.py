@@ -4,6 +4,8 @@ from typing import Annotated
 import numpy as np
 import pickle
 import os
+import shap  # OPSI 3: wrapper black-box (lihat lifespan & _explain_single)
+from collections import defaultdict
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -25,6 +27,7 @@ MODEL_GRU      = os.path.join(BASE_DIR, "src", "models",    "best_model_gru.kera
 MODEL_CNN      = os.path.join(BASE_DIR, "src", "models",    "best_model_cnn_bilstm.keras")
 TOKENIZER_PATH = os.path.join(BASE_DIR, "src", "tokenizer", "tokenizer.pkl")
 TFIDF_PATH     = os.path.join(BASE_DIR, "src", "tokenizer", "tfidf_vectorizer.pkl")
+
 MAX_LEN_BILSTM = 200
 MAX_LEN_GRU    = 250
 MAX_LEN_CNN    = 250
@@ -109,6 +112,36 @@ async def lifespan(app: FastAPI):
         app_state["tfidf"] = pickle.load(f)
 
     print("✅ Semua model & vectorizer berhasil dimuat.")
+
+    # ── PIVOT KE OPSI 3: wrapper black-box (bukan lagi DeepExplainer/GradientExplainer) ──
+    # Setelah 2x percobaan (DeepExplainer, lalu GradientExplainer) tetap gagal
+    # karena ketidakcocokan gradien custom AttentionLayer dengan TF2 di environment
+    # ini, pindah ke pendekatan yang SAMA SEKALI TIDAK menyentuh gradien model.
+    # shap.Explainer dengan Text masker cukup memanggil model.predict() berkali-kali
+    # (persis seperti endpoint /predict yang sudah terbukti jalan normal), jadi
+    # kelas bug gradien ini otomatis tidak relevan lagi.
+    #
+    # Bonus: karena caranya cuma manggil predict() pada teks yang diubah-ubah
+    # (bukan berdasarkan baseline numerik), background_samples.pkl JADI TIDAK
+    # DIPERLUKAN lagi untuk pendekatan ini.
+    def _ensemble_predict_fn(texts: list[str]) -> np.ndarray:
+        """Fungsi predict() gabungan ensemble, dipakai sebagai 'kotak hitam' oleh SHAP."""
+        probs = []
+        for t in texts:
+            p_bilstm, p_gru, p_cnn = _predict_single(t)
+            probs.append(np.mean([p_bilstm, p_gru, p_cnn]))
+        return np.array(probs)
+
+    app_state["explain_fn"] = _ensemble_predict_fn
+    # Text masker default SHAP memecah kata pakai regex yang menganggap tanda
+    # hubung (-) sebagai pemisah — bikin "COVID-19" jadi "COVID-"+"19",
+    # "diam-diam" jadi "diam"+"diam-". Pakai tokenizer regex \S+ (pisah
+    # cuma berdasarkan spasi) supaya kata dengan tanda hubung tetap utuh.
+    app_state["explainer"] = shap.Explainer(
+        _ensemble_predict_fn, shap.maskers.Text(r"\S+")
+    )
+    print("🔍 SHAP wrapper explainer siap (black-box, tanpa gradien).")
+
     yield
     app_state.clear()
     VOCAB_SIZE.clear()
@@ -170,6 +203,40 @@ class BatchPredictRequest(BaseModel):
 class BatchPredictResponse(BaseModel):
     results: list[PredictResponse]
 
+
+class WordScore(BaseModel):
+    word:  str
+    score: float  # positif = mendorong ke arah HOAKS, negatif = ke arah FAKTA
+
+
+class ExplainResponse(BaseModel):
+    text:        str
+    label:       str
+    confidence:  float
+    word_scores: list[WordScore]  # sudah digabung dari ketiga model, diurutkan dari kontribusi terbesar
+
+
+class VocabCheckRequest(BaseModel):
+    words: Annotated[list[str], Field(min_length=1, max_length=50)]
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"words": ["chip", "cip", "mengandung", "vaksin"]}]
+        }
+    }
+
+
+class VocabCheckResult(BaseModel):
+    word:          str
+    word_lower:    str   # tokenizer Keras biasanya lowercase semua kata sebelum dicek
+    in_vocab:      bool
+    tokenizer_index: int | None  # None kalau OOV (tidak dikenal tokenizer)
+    tfidf_index:     int | None  # None kalau kata ini tidak ada di vocabulary TF-IDF
+
+
+class VocabCheckResponse(BaseModel):
+    results: list[VocabCheckResult]
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def _pad(texts: list[str], maxlen: int, vocab_size: int) -> np.ndarray:
     """Tokenize, pad, lalu clip index agar tidak melebihi vocab embedding."""
@@ -221,6 +288,39 @@ def _build_response(text: str, p_bilstm: float, p_gru: float, p_cnn: float) -> P
     )
 
 
+# ─── OPSI 3: wrapper black-box helper ──────────────────────────────────────────
+def _explain_single(text: str) -> tuple[dict[str, float], float, float, float]:
+    """
+    Jalankan SHAP wrapper (black-box) pada satu teks. Berbeda dari pendekatan
+    gradien sebelumnya, di sini SHAP tidak pernah menyentuh index tokenizer,
+    embedding, atau gradien model sama sekali — dia cuma memanggil
+    _ensemble_predict_fn(list_teks) berkali-kali dengan variasi kata yang
+    dihapus/di-mask, lalu membandingkan perubahan probabilitasnya. Hasilnya
+    otomatis berupa skor PER KATA (bukan per index), jadi tidak perlu proses
+    translate atau gabung-3-model manual seperti pendekatan sebelumnya.
+    """
+    explainer = app_state.get("explainer")
+    if explainer is None:
+        raise RuntimeError("SHAP explainer belum siap.")
+
+    explanation = explainer([text], max_evals=500)  # naikkan dari default supaya skor lebih stabil
+
+    words = explanation.data[0]     # array kata hasil pemecahan teks oleh Text masker
+    scores = explanation.values[0]  # array skor SHAP, urutannya sejajar dengan `words`
+
+    merged_scores: dict[str, float] = defaultdict(float)
+    for word, score in zip(words, scores):
+        w = str(word).strip()
+        if not w:
+            continue
+        merged_scores[w] += float(score)
+
+    # Prediksi label tetap pakai jalur predict biasa (bukan dari SHAP),
+    # supaya labelnya konsisten dengan endpoint /predict yang sudah ada.
+    p_bilstm, p_gru, p_cnn = _predict_single(text)
+    return dict(merged_scores), p_bilstm, p_gru, p_cnn
+
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
@@ -258,3 +358,66 @@ def predict_batch(request: BatchPredictRequest):
         return BatchPredictResponse(results=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/predict/explain", response_model=ExplainResponse, tags=["Explainability"])
+def predict_explain(request: PredictRequest):
+    """
+    OPSI 3 — Prediksi + penjelasan XAI via SHAP wrapper black-box.
+    Ensemble (bilstm+gru+cnn) di-treat sebagai satu fungsi predict tunggal;
+    SHAP memperturbasi teks input (bukan gradien/index internal model) untuk
+    menghitung kontribusi tiap kata. Lebih berat secara komputasi dibanding
+    /predict biasa — cocok dipakai saat pengguna memang minta penjelasan,
+    bukan dipanggil di setiap prediksi.
+    """
+    if app_state.get("explainer") is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Explainability belum aktif — explainer gagal dibuat saat startup.",
+        )
+    try:
+        merged_scores, p_bilstm, p_gru, p_cnn = _explain_single(request.text)
+        base_response = _build_response(request.text, p_bilstm, p_gru, p_cnn)
+
+        word_scores = sorted(
+            (WordScore(word=w, score=round(s, 4)) for w, s in merged_scores.items()),
+            key=lambda ws: abs(ws.score),
+            reverse=True,
+        )
+
+        return ExplainResponse(
+            text=request.text,
+            label=base_response.label,
+            confidence=base_response.confidence,
+            word_scores=word_scores,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/debug/vocab-check", response_model=VocabCheckResponse, tags=["Debug"])
+def vocab_check(request: VocabCheckRequest):
+    """
+    Cek apakah suatu kata dikenal (ada di vocabulary) tokenizer sequence
+    dan/atau TF-IDF vectorizer, atau malah OOV (out-of-vocabulary).
+    Berguna untuk investigasi kenapa suatu kata dapat skor SHAP yang
+    janggal/tidak sesuai intuisi — kalau in_vocab=False, kata itu tidak
+    pernah "dilihat" model dengan bentuk aslinya saat training.
+    """
+    tokenizer = app_state["tokenizer"]
+
+    results = []
+    for word in request.words:
+        word_lower = word.lower()
+        tok_idx = tokenizer.word_index.get(word_lower)
+        tfidf_idx = app_state["tfidf"].vocabulary_.get(word_lower)
+
+        results.append(VocabCheckResult(
+            word=word,
+            word_lower=word_lower,
+            in_vocab=tok_idx is not None,
+            tokenizer_index=tok_idx,
+            tfidf_index=tfidf_idx,
+        ))
+
+    return VocabCheckResponse(results=results)
