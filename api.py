@@ -52,6 +52,7 @@ TOKENIZER_SHARED_PATH = os.path.join(BASE_DIR, "src", "tokenizer", "tokenizer_gr
 TFIDF_PATH     = os.path.join(BASE_DIR, "src", "tokenizer", "tfidf_vectorizer.pkl")
 BACKGROUND_PATH = os.path.join(BASE_DIR, "src", "tokenizer", "background_samples.pkl")
 BACKGROUND_SIZE = 50  # jumlah sampel background yang dipakai (trade-off akurasi vs kecepatan)
+SHAP_NSAMPLES = 50 # default shap = 200; makin kecil makin cepat, tapi skor makin noisy
 
 MAX_LEN_BILSTM = 200
 MAX_LEN_GRU    = 250
@@ -265,6 +266,7 @@ async def lifespan(app: FastAPI):
 
     app_state["explainers"] = {}
     app_state["embed_models"] = {}
+    app_state["post_embed_models"] = {}
     if os.path.exists(BACKGROUND_PATH):
         with open(BACKGROUND_PATH, "rb") as f:
             background_texts = pickle.load(f)[:BACKGROUND_SIZE]
@@ -284,11 +286,13 @@ async def lifespan(app: FastAPI):
         bg_embed_bilstm = embed_bilstm.predict(bg_bilstm, verbose=0)
         app_state["explainers"]["bilstm"] = shap.GradientExplainer(post_bilstm, bg_embed_bilstm)
         app_state["embed_models"]["bilstm"] = embed_bilstm
+        app_state["post_embed_models"]["bilstm"] = post_bilstm
 
         embed_gru, post_gru = _build_embedding_submodels(app_state["gru"])
         bg_embed_gru = embed_gru.predict(bg_gru, verbose=0)
         app_state["explainers"]["gru"] = shap.GradientExplainer(post_gru, bg_embed_gru)
         app_state["embed_models"]["gru"] = embed_gru
+        app_state["post_embed_models"]["gru"] = post_gru
 
         # Model CNN hybrid: cabang TF-IDF sudah berupa angka float (punya
         # gradien), jadi cukup dipertahankan sebagai extra_inputs apa adanya —
@@ -304,6 +308,7 @@ async def lifespan(app: FastAPI):
         bg_embed_cnn = embed_cnn.predict(bg_cnn, verbose=0)
         app_state["explainers"]["cnn"] = shap.GradientExplainer(post_cnn, [bg_embed_cnn, bg_tfidf])
         app_state["embed_models"]["cnn"] = embed_cnn
+        app_state["post_embed_models"]["cnn"] = post_cnn
 
         print(f"🔍 GradientExplainer siap (background: {len(background_texts)} sampel).")
     else:
@@ -557,17 +562,17 @@ def _explain_single(text: str) -> tuple[dict[str, float], float, float, float]:
     # untuk dapat satu skor per posisi token (skor kontribusi token itu =
     # total kontribusi semua dimensi vektor embedding-nya).
     emb_bilstm = embed_models["bilstm"].predict(pad_bilstm, verbose=0)
-    sv_bilstm = _squeeze_shap_output(explainers["bilstm"].shap_values(_dup(emb_bilstm)))[0]
+    sv_bilstm = _squeeze_shap_output(explainers["bilstm"].shap_values(_dup(emb_bilstm), nsamples=SHAP_NSAMPLES))[0]
     sv_bilstm = sv_bilstm.sum(axis=-1)
     words_bilstm = _sequence_shap_to_words(sv_bilstm, orig_bilstm, index_to_word["bilstm"])
 
     emb_gru = embed_models["gru"].predict(pad_gru, verbose=0)
-    sv_gru = _squeeze_shap_output(explainers["gru"].shap_values(_dup(emb_gru)))[0]
+    sv_gru = _squeeze_shap_output(explainers["gru"].shap_values(_dup(emb_gru), nsamples=SHAP_NSAMPLES))[0]
     sv_gru = sv_gru.sum(axis=-1)
     words_gru = _sequence_shap_to_words(sv_gru, orig_gru, index_to_word["gru"])
 
     emb_cnn = embed_models["cnn"].predict(pad_cnn, verbose=0)
-    sv_cnn_seq, sv_cnn_tfidf = explainers["cnn"].shap_values([_dup(emb_cnn), _dup(tfidf_feat)])
+    sv_cnn_seq, sv_cnn_tfidf = explainers["cnn"].shap_values([_dup(emb_cnn), _dup(tfidf_feat)], nsamples=SHAP_NSAMPLES)
     sv_cnn_seq   = _squeeze_shap_output(sv_cnn_seq)[0]
     sv_cnn_seq   = sv_cnn_seq.sum(axis=-1)
     sv_cnn_tfidf = _squeeze_shap_output(sv_cnn_tfidf)[0]
@@ -590,7 +595,12 @@ def _explain_single(text: str) -> tuple[dict[str, float], float, float, float]:
 
     merged_scores = {w: totals[w] / counts[w] for w in totals}
 
-    p_bilstm, p_gru, p_cnn = _predict_single(text)
+    post_embed_models = app_state["post_embed_models"]
+
+    p_bilstm = float(post_embed_models["bilstm"].predict(emb_bilstm, verbose=0).flatten()[0])
+    p_gru    = float(post_embed_models["gru"].predict(emb_gru, verbose=0).flatten()[0])
+    p_cnn    = float(post_embed_models["cnn"].predict([emb_cnn, tfidf_feat], verbose=0).flatten()[0])
+
     return merged_scores, p_bilstm, p_gru, p_cnn
 
 
