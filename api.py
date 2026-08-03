@@ -4,6 +4,8 @@ from typing import Annotated
 import numpy as np
 import pickle
 import os
+import shap  
+from collections import defaultdict
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -23,8 +25,35 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_BILSTM   = os.path.join(BASE_DIR, "src", "models",    "best_model_bilstm.keras")
 MODEL_GRU      = os.path.join(BASE_DIR, "src", "models",    "best_model_gru.keras")
 MODEL_CNN      = os.path.join(BASE_DIR, "src", "models",    "best_model_cnn_bilstm.keras")
-TOKENIZER_PATH = os.path.join(BASE_DIR, "src", "tokenizer", "tokenizer.pkl")
+
+# PENTING — root cause bias prediksi bilstm ke HOAKS: bilstm dilatih dengan
+# tokenizer HASIL FIT SENDIRI (VOCAB_SIZE=50000, lihat notebook training),
+# tapi gru & cnn dilatih dengan tokenizer fit terpisah (VOCAB_SIZE=20000).
+# Kedua notebook menyimpan ke NAMA FILE YANG SAMA ("tokenizer.pkl"), sehingga
+# salah satu menimpa yang lain di Google Drive — dan api.py lama cuma load
+# SATU tokenizer.pkl dipakai bareng untuk ketiga model. Akibatnya word_index
+# yang dipakai saat inferensi bilstm TIDAK COCOK dengan word_index yang dia
+# lihat saat training, membuat setiap kata dipetakan ke index "asing" bagi
+# bilstm — inilah yang menyebabkan prediksinya ngaco/bias ke HOAKS.
+#
+# Fix: bilstm sekarang punya file tokenizer sendiri (tokenizer_bilstm.pkl),
+# terpisah dari tokenizer.pkl yang dipakai gru & cnn. tokenizer_bilstm.pkl
+# HARUS di-refit dari X_train yang SAMA PERSIS dengan waktu bilstm dilatih
+# (fit_on_texts bersifat deterministik terhadap corpus yang sama) — lihat
+# instruksi refit di notebook model bilstm.
+# PENTING (update ke-2): tokenizer.pkl yang lama TERBUKTI SUDAH TERTIMPA juga
+# — hasil debug menunjukkan tokenizer.pkl yang "seharusnya" untuk gru/cnn
+# (num_words=20000) ternyata sekarang num_words=50000, identik dengan
+# tokenizer bilstm. Artinya tokenizer.pkl sudah lama tidak bisa dipercaya
+# sebagai tokenizer asli gru/cnn. Pakai file baru yang eksplisit hasil refit
+# ulang dari X_train notebook gru/cnn (num_words=20000).
+TOKENIZER_BILSTM_PATH = os.path.join(BASE_DIR, "src", "tokenizer", "tokenizer_bilstm.pkl")
+TOKENIZER_SHARED_PATH = os.path.join(BASE_DIR, "src", "tokenizer", "tokenizer_gru.pkl")  # dipakai gru & cnn
 TFIDF_PATH     = os.path.join(BASE_DIR, "src", "tokenizer", "tfidf_vectorizer.pkl")
+BACKGROUND_PATH = os.path.join(BASE_DIR, "src", "tokenizer", "background_samples.pkl")
+BACKGROUND_SIZE = 50  # jumlah sampel background yang dipakai (trade-off akurasi vs kecepatan)
+SHAP_NSAMPLES = 50 # default shap = 200; makin kecil makin cepat, tapi skor makin noisy
+
 MAX_LEN_BILSTM = 200
 MAX_LEN_GRU    = 250
 MAX_LEN_CNN    = 250
@@ -68,19 +97,96 @@ VOCAB_SIZE: dict[str, int] = {}
 
 def _check_files() -> None:
     missing = [
-        p for p in [MODEL_BILSTM, MODEL_GRU, MODEL_CNN, TOKENIZER_PATH, TFIDF_PATH]
+        p for p in [MODEL_BILSTM, MODEL_GRU, MODEL_CNN, TOKENIZER_BILSTM_PATH, TOKENIZER_SHARED_PATH, TFIDF_PATH]
         if not os.path.exists(p)
     ]
     if missing:
-        raise FileNotFoundError("File tidak ditemukan:\n" + "\n".join(missing))
+        raise FileNotFoundError(
+            "File tidak ditemukan:\n" + "\n".join(missing) +
+            "\n\nKalau tokenizer_bilstm.pkl yang hilang: refit tokenizer di notebook "
+            "bilstm dengan X_train yang SAMA PERSIS seperti waktu training, lalu "
+            "simpan sebagai tokenizer_bilstm.pkl (JANGAN timpa tokenizer.pkl yang "
+            "dipakai gru/cnn)."
+        )
+
+
+def _find_embedding_layer_recursive(model: tf.keras.Model) -> tf.keras.layers.Layer | None:
+    """Cari layer Embedding PERTAMA di model, rekursif ke dalam submodel/layer
+    bersarang (mis. model dibangun dengan blok Functional/Sequential di dalam
+    Functional lain). Pencarian by-name saja ("embedding" in layer.name) TIDAK
+    CUKUP kalau layer Embedding-nya bersarang di dalam submodel — dia tidak
+    akan muncul di model.layers top-level sama sekali, dan pencarian gagal
+    secara DIAM-DIAM (lihat _get_embedding_vocab_size lama yang jatuh ke
+    fallback 50000 untuk bilstm, padahal vocab asli bilstm bukan 50000 —
+    inilah akar penyebab bias prediksi bilstm ke HOAKS)."""
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.layers.Embedding):
+            return layer
+        # Turun rekursif kalau layer ini sendiri adalah model/container bersarang
+        if hasattr(layer, "layers"):
+            found = _find_embedding_layer_recursive(layer)
+            if found is not None:
+                return found
+    return None
+
+
+def _embedding_layer(model: tf.keras.Model) -> tf.keras.layers.Layer:
+    """Cari layer Embedding pertama di model (rekursif). Dipakai untuk memotong
+    model jadi dua bagian saat setup GradientExplainer (lihat _build_embedding_submodels)."""
+    layer = _find_embedding_layer_recursive(model)
+    if layer is None:
+        raise ValueError(f"Tidak ditemukan layer Embedding di model '{model.name}'.")
+    return layer
 
 
 def _get_embedding_vocab_size(model: tf.keras.Model) -> int:
-    """Ambil input_dim dari layer Embedding pertama di model."""
-    for layer in model.layers:
-        if "embedding" in layer.name.lower():
-            return layer.get_config()["input_dim"]
-    return 50000  
+    """Ambil input_dim dari layer Embedding pertama di model (rekursif).
+    SENGAJA raise error kalau tidak ketemu — JANGAN fallback diam-diam ke
+    angka default, karena angka default yang salah akan lolos ke _pad() dan
+    membuat clipping index salah tanpa error apa pun yang kelihatan (ini yang
+    terjadi pada bilstm sebelumnya: fallback 50000 dipakai padahal vocab asli
+    bilstm bukan 50000, menyebabkan lookup Embedding ke luar jangkauan asli
+    dan prediksi bilstm jadi ngaco/bias ke HOAKS)."""
+    layer = _find_embedding_layer_recursive(model)
+    if layer is None:
+        raise ValueError(
+            f"Tidak ditemukan layer Embedding di model '{model.name}' — "
+            "cek model.summary() untuk lihat struktur aslinya."
+        )
+    return layer.get_config()["input_dim"]
+
+
+def _build_embedding_submodels(
+    model: tf.keras.Model, extra_inputs: list | None = None
+) -> tuple[tf.keras.Model, tf.keras.Model]:
+    """
+    ROOT CAUSE FIX untuk error "zero-dimensional arrays cannot be concatenated":
+    GradientExplainer butuh gradien output model terhadap INPUT model. Tapi input
+    model kita adalah index integer hasil tokenizer — index integer tidak punya
+    gradien (cuma dipakai untuk lookup di layer Embedding), jadi tf.GradientTape
+    mengembalikan None, lalu shap mencoba np.concatenate(None, ...) dan meledak.
+    Ini bug/limitasi shap yang sudah lama dilaporkan (shap issue #965, #496,
+    #1119) dan TIDAK bisa diperbaiki dengan gonta-ganti versi numpy/shap.
+
+    Fix-nya: jangan explain dari input integer, tapi dari OUTPUT layer Embedding
+    (berupa vektor float, punya gradien). Makanya model dipecah jadi dua:
+      - embed_model      : input token index (int)      -> vektor embedding (float)
+      - post_embed_model : vektor embedding (+extra_inputs) -> prediksi akhir
+    GradientExplainer dijalankan di post_embed_model, dengan background data
+    berupa hasil embed_model.predict(...), bukan sequence mentah.
+
+    extra_inputs: tensor input lain yang ikut dipertahankan apa adanya di
+    post_embed_model (dipakai untuk cabang TF-IDF di model CNN hybrid, yang
+    memang sudah berupa angka float sehingga punya gradien dan tidak perlu
+    "dipotong" seperti cabang sequence).
+    """
+    embed_layer = _embedding_layer(model)
+    embed_model = tf.keras.Model(inputs=embed_layer.input, outputs=embed_layer.output)
+
+    post_inputs = [embed_layer.output] + (extra_inputs or [])
+    post_embed_model = tf.keras.Model(inputs=post_inputs, outputs=model.output)
+
+    return embed_model, post_embed_model
 
 
 @asynccontextmanager
@@ -102,13 +208,112 @@ async def lifespan(app: FastAPI):
     VOCAB_SIZE["cnn"]    = _get_embedding_vocab_size(app_state["cnn"])
     print(f"📐 Vocab sizes — bilstm:{VOCAB_SIZE['bilstm']} | gru:{VOCAB_SIZE['gru']} | cnn:{VOCAB_SIZE['cnn']}")
 
-    with open(TOKENIZER_PATH, "rb") as f:
-        app_state["tokenizer"] = pickle.load(f)
+    with open(TOKENIZER_BILSTM_PATH, "rb") as f:
+        tokenizer_bilstm = pickle.load(f)
+    with open(TOKENIZER_SHARED_PATH, "rb") as f:
+        tokenizer_shared = pickle.load(f)
+
+    # ROOT CAUSE FIX bias bilstm ke HOAKS: dulu ketiga model berbagi SATU
+    # tokenizer.pkl, padahal bilstm dilatih dengan tokenizer hasil fit
+    # terpisah (VOCAB_SIZE=50000) yang tertimpa oleh tokenizer gru/cnn
+    # (VOCAB_SIZE=20000) karena disimpan ke nama file yang sama saat training.
+    # Sekarang tiap model pakai tokenizer yang benar-benar cocok dengan
+    # word_index yang dia lihat saat training.
+    app_state["tokenizers"] = {
+        "bilstm": tokenizer_bilstm,
+        "gru":    tokenizer_shared,
+        "cnn":    tokenizer_shared,
+    }
 
     with open(TFIDF_PATH, "rb") as f:
         app_state["tfidf"] = pickle.load(f)
 
     print("✅ Semua model & vectorizer berhasil dimuat.")
+
+    # ── DEBUG: pastikan tiap tokenizer benar & vocab_size-nya berpasangan ──
+    for _name in ("bilstm", "gru", "cnn"):
+        _tok = app_state["tokenizers"][_name]
+        print(f"Tokenizer '{_name}' — num_words: {_tok.num_words} | word_index size: {len(_tok.word_index)}")
+    print("VOCAB_SIZE per model (dari embedding layer):", VOCAB_SIZE)
+
+    # VALIDASI OTOMATIS: num_words tokenizer HARUS SAMA dengan input_dim
+    # embedding model. Kalau beda, berarti tokenizer yang ke-load bukan
+    # tokenizer asli model itu (skenario "file tertimpa" yang dua kali
+    # kejadian di project ini) — mending gagal keras (fail loud) saat startup
+    # daripada diam-diam menghasilkan prediksi yang salah.
+    for _name in ("bilstm", "gru", "cnn"):
+        _tok_num_words = app_state["tokenizers"][_name].num_words
+        _model_vocab   = VOCAB_SIZE[_name]
+        if _tok_num_words != _model_vocab:
+            raise RuntimeError(
+                f"MISMATCH tokenizer vs model untuk '{_name}': "
+                f"tokenizer.num_words={_tok_num_words} tapi embedding model input_dim={_model_vocab}. "
+                "Tokenizer yang ke-load kemungkinan BUKAN tokenizer asli model ini "
+                "(kemungkinan besar file tertimpa training model lain). "
+                "Cek ulang file tokenizer yang dipakai untuk model ini sebelum lanjut."
+            )
+    print("✅ Validasi tokenizer vs model OK — num_words tiap tokenizer cocok dengan embedding model-nya.")
+    # ── akhir debug ──
+
+    # ── OPSI 1: Setup GradientExplainer per model ──────────────────────────
+    # index_to_word sekarang HARUS per tokenizer, karena bilstm punya
+    # word_index yang berbeda dari gru/cnn (lihat catatan di atas).
+    app_state["index_to_word"] = {
+        name: {idx: word for word, idx in tok.word_index.items()}
+        for name, tok in app_state["tokenizers"].items()
+    }
+    app_state["tfidf_feature_names"] = app_state["tfidf"].get_feature_names_out()
+
+    app_state["explainers"] = {}
+    app_state["embed_models"] = {}
+    app_state["post_embed_models"] = {}
+    if os.path.exists(BACKGROUND_PATH):
+        with open(BACKGROUND_PATH, "rb") as f:
+            background_texts = pickle.load(f)[:BACKGROUND_SIZE]
+
+        bg_bilstm = _pad(background_texts, app_state["tokenizers"]["bilstm"], MAX_LEN_BILSTM, VOCAB_SIZE["bilstm"])
+        bg_gru    = _pad(background_texts, app_state["tokenizers"]["gru"],    MAX_LEN_GRU,    VOCAB_SIZE["gru"])
+        bg_cnn    = _pad(background_texts, app_state["tokenizers"]["cnn"],    MAX_LEN_CNN,    VOCAB_SIZE["cnn"])
+        bg_tfidf  = app_state["tfidf"].transform(background_texts).toarray().astype(np.float32)
+
+        # OPSI 1 — GradientExplainer dijalankan di post_embed_model (lihat
+        # _build_embedding_submodels), BUKAN di model asli. Ini fix untuk error
+        # "zero-dimensional arrays cannot be concatenated" yang akar masalahnya
+        # adalah gradien None dari layer Embedding terhadap input integer
+        # (shap issue #965) — bukan soal versi numpy/shap yang bentrok.
+
+        embed_bilstm, post_bilstm = _build_embedding_submodels(app_state["bilstm"])
+        bg_embed_bilstm = embed_bilstm.predict(bg_bilstm, verbose=0)
+        app_state["explainers"]["bilstm"] = shap.GradientExplainer(post_bilstm, bg_embed_bilstm)
+        app_state["embed_models"]["bilstm"] = embed_bilstm
+        app_state["post_embed_models"]["bilstm"] = post_bilstm
+
+        embed_gru, post_gru = _build_embedding_submodels(app_state["gru"])
+        bg_embed_gru = embed_gru.predict(bg_gru, verbose=0)
+        app_state["explainers"]["gru"] = shap.GradientExplainer(post_gru, bg_embed_gru)
+        app_state["embed_models"]["gru"] = embed_gru
+        app_state["post_embed_models"]["gru"] = post_gru
+
+        # Model CNN hybrid: cabang TF-IDF sudah berupa angka float (punya
+        # gradien), jadi cukup dipertahankan sebagai extra_inputs apa adanya —
+        # yang perlu "dipotong" cuma cabang sequence-nya.
+        # CATATAN: nama layer Input untuk cabang TF-IDF diasumsikan "input_tfidf"
+        # (sesuai key dict yang dipakai di _predict_single/model.predict()).
+        # Kalau nama layer aslinya beda, sesuaikan string di get_layer() di bawah
+        # — cek dengan app_state["cnn"].summary() kalau terjadi KeyError di sini.
+        tfidf_input_tensor = app_state["cnn"].get_layer("input_tfidf").output
+        embed_cnn, post_cnn = _build_embedding_submodels(
+            app_state["cnn"], extra_inputs=[tfidf_input_tensor]
+        )
+        bg_embed_cnn = embed_cnn.predict(bg_cnn, verbose=0)
+        app_state["explainers"]["cnn"] = shap.GradientExplainer(post_cnn, [bg_embed_cnn, bg_tfidf])
+        app_state["embed_models"]["cnn"] = embed_cnn
+        app_state["post_embed_models"]["cnn"] = post_cnn
+
+        print(f"🔍 GradientExplainer siap (background: {len(background_texts)} sampel).")
+    else:
+        print(f"⚠️  Background samples tidak ditemukan di {BACKGROUND_PATH} — /predict/explain nonaktif.")
+
     yield
     app_state.clear()
     VOCAB_SIZE.clear()
@@ -170,12 +375,65 @@ class BatchPredictRequest(BaseModel):
 class BatchPredictResponse(BaseModel):
     results: list[PredictResponse]
 
+
+class WordScore(BaseModel):
+    word:  str
+    score: float  # positif = mendorong ke arah HOAKS, negatif = ke arah FAKTA
+
+
+class ExplainResponse(BaseModel):
+    text:        str
+    label:       str
+    confidence:  float
+    word_scores: list[WordScore]  # sudah digabung dari ketiga model, diurutkan dari kontribusi terbesar
+
+
+class VocabCheckRequest(BaseModel):
+    words: Annotated[list[str], Field(min_length=1, max_length=50)]
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"words": ["chip", "cip", "mengandung", "vaksin"]}]
+        }
+    }
+
+
+class VocabCheckResult(BaseModel):
+    word:          str
+    word_lower:    str   # tokenizer Keras biasanya lowercase semua kata sebelum dicek
+    in_vocab_bilstm: bool
+    in_vocab_gru_cnn: bool
+    tokenizer_index_bilstm: int | None   # index di tokenizer_bilstm.pkl, None kalau OOV
+    tokenizer_index_gru_cnn: int | None  # index di tokenizer.pkl (dipakai gru & cnn), None kalau OOV
+    tfidf_index:     int | None  # None kalau kata ini tidak ada di vocabulary TF-IDF
+
+
+class VocabCheckResponse(BaseModel):
+    results: list[VocabCheckResult]
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-def _pad(texts: list[str], maxlen: int, vocab_size: int) -> np.ndarray:
-    """Tokenize, pad, lalu clip index agar tidak melebihi vocab embedding."""
-    sequences = app_state["tokenizer"].texts_to_sequences(texts)
+def _pad(texts: list[str], tokenizer, maxlen: int, vocab_size: int) -> np.ndarray:
+    """Tokenize (pakai tokenizer MILIK MODEL yang bersangkutan — lihat
+    app_state["tokenizers"], bilstm punya tokenizer beda dari gru/cnn), pad,
+    lalu clip index agar tidak melebihi vocab embedding.
+    PENTING: hasil clip ini cuma boleh dipakai untuk FEED ke model (embedding
+    lookup), JANGAN dipakai untuk translate index->kata (lihat _original_sequence)
+    — kalau index tokenizer aslinya > vocab_size-1, clip akan menggantinya jadi
+    index kata LAIN yang kebetulan menempati vocab_size-1, bukan kata aslinya."""
+    sequences = tokenizer.texts_to_sequences(texts)
     padded = pad_sequences(sequences, maxlen=maxlen, truncating="post", padding="post")
     return np.clip(padded, 0, vocab_size - 1)
+
+
+def _original_sequence(texts: list[str], tokenizer, maxlen: int) -> np.ndarray:
+    """Sequence tokenizer (MILIK MODEL yang bersangkutan) TANPA clip vocab_size
+    — dipakai KHUSUS untuk translate index->kata yang benar di /predict/explain.
+    Model tetap di-feed pakai versi ter-clip dari _pad(), tapi label kata di
+    response harus pakai index asli ini, supaya kata yang index-nya kebetulan
+    > vocab_size model tidak salah nyasar ke kata lain saat ditranslate
+    index_to_word."""
+    sequences = tokenizer.texts_to_sequences(texts)
+    return pad_sequences(sequences, maxlen=maxlen, truncating="post", padding="post")
 
 
 def _tfidf(texts: list[str]) -> np.ndarray:
@@ -184,9 +442,10 @@ def _tfidf(texts: list[str]) -> np.ndarray:
 
 def _predict_single(text: str) -> tuple[float, float, float]:
     """Prediksi satu teks, kembalikan (prob_bilstm, prob_gru, prob_cnn)."""
-    pad_bilstm = _pad([text], MAX_LEN_BILSTM, VOCAB_SIZE["bilstm"])
-    pad_gru    = _pad([text], MAX_LEN_GRU,    VOCAB_SIZE["gru"])
-    pad_cnn    = _pad([text], MAX_LEN_CNN,    VOCAB_SIZE["cnn"])
+    tokenizers = app_state["tokenizers"]
+    pad_bilstm = _pad([text], tokenizers["bilstm"], MAX_LEN_BILSTM, VOCAB_SIZE["bilstm"])
+    pad_gru    = _pad([text], tokenizers["gru"],    MAX_LEN_GRU,    VOCAB_SIZE["gru"])
+    pad_cnn    = _pad([text], tokenizers["cnn"],    MAX_LEN_CNN,    VOCAB_SIZE["cnn"])
     tfidf_feat = _tfidf([text])
 
     p_bilstm = float(app_state["bilstm"].predict(pad_bilstm, verbose=0).flatten()[0])
@@ -219,6 +478,130 @@ def _build_response(text: str, p_bilstm: float, p_gru: float, p_cnn: float) -> P
             cnn_bilstm=round(p_cnn, 4),
         ),
     )
+
+
+# ─── OPSI 1: GradientExplainer helpers ─────────────────────────────────────────
+def _squeeze_shap_output(raw) -> np.ndarray:
+    """Normalisasi bentuk output shap_values() (beda-beda antar versi shap) jadi array 1D."""
+    arr = np.array(raw)
+    return arr.squeeze()
+
+
+def _dup(arr: np.ndarray) -> np.ndarray:
+    """Workaround: sebagian versi shap error kalau dikasih batch size 1. Duplikasi jadi 2, ambil baris pertama nanti."""
+    return np.concatenate([arr, arr], axis=0)
+
+
+def _sequence_shap_to_words(shap_vals_seq: np.ndarray, padded_seq: np.ndarray, index_to_word: dict) -> dict[str, float]:
+    """Translate skor SHAP dari index tokenizer balik ke kata asli (index 0 = padding, dilewati)."""
+    scores: dict[str, float] = {}
+    seq = padded_seq.flatten()
+    for token_index, score in zip(seq, shap_vals_seq):
+        if token_index == 0:
+            continue
+        word = index_to_word.get(int(token_index))
+        if word is None:
+            continue
+        scores[word] = scores.get(word, 0.0) + float(score)
+    return scores
+
+
+def _tfidf_shap_to_words(
+    shap_vals_tfidf: np.ndarray, tfidf_input_vec: np.ndarray, feature_names: np.ndarray
+) -> dict[str, float]:
+    """Translate skor SHAP dari kolom TF-IDF (khusus jalur hybrid CNN) balik ke
+    kata asli. HANYA kata yang benar-benar muncul di teks input (nilai TF-IDF
+    != 0) yang disertakan.
+
+    PENTING: filter-nya berdasarkan nilai TF-IDF INPUT (tfidf_input_vec), BUKAN
+    berdasarkan apakah skor SHAP-nya 0. SHAP menghitung kontribusi dibanding
+    rata-rata background, jadi kata yang TIDAK ADA di teks (tfidf=0) tetap bisa
+    dapat skor SHAP kecil non-zero (mencerminkan "ketiadaan kata ini dibanding
+    artikel rata-rata"). Itu valid secara matematis tapi tidak relevan untuk
+    highlight kata di artikel — makanya harus difilter dari sisi input, bukan
+    dari sisi skor.
+    """
+    scores: dict[str, float] = {}
+    for i, present in enumerate(tfidf_input_vec):
+        if present == 0:
+            continue
+        word = feature_names[i]
+        scores[word] = scores.get(word, 0.0) + float(shap_vals_tfidf[i])
+    return scores
+
+
+def _explain_single(text: str) -> tuple[dict[str, float], float, float, float]:
+    """Jalankan GradientExplainer untuk ketiga model, gabungkan (rata-rata) skor kata lintas model."""
+    explainers = app_state["explainers"]
+    if not explainers:
+        raise RuntimeError("GradientExplainer belum siap — background_samples.pkl tidak ditemukan saat startup.")
+
+    tokenizers     = app_state["tokenizers"]
+    index_to_word  = app_state["index_to_word"]  # sekarang dict per model: index_to_word["bilstm"], dst.
+    embed_models   = app_state["embed_models"]
+
+    pad_bilstm = _pad([text], tokenizers["bilstm"], MAX_LEN_BILSTM, VOCAB_SIZE["bilstm"])
+    pad_gru    = _pad([text], tokenizers["gru"],    MAX_LEN_GRU,    VOCAB_SIZE["gru"])
+    pad_cnn    = _pad([text], tokenizers["cnn"],    MAX_LEN_CNN,    VOCAB_SIZE["cnn"])
+    tfidf_feat = _tfidf([text])
+
+    # Sequence ASLI (tanpa clip vocab_size) — dipakai KHUSUS untuk translate
+    # index->kata yang benar, pakai tokenizer masing-masing model (bilstm
+    # tokenizernya beda dari gru/cnn — lihat catatan root cause di atas).
+    # pad_bilstm/pad_gru/pad_cnn (yang sudah di-clip) tetap dipakai untuk feed
+    # ke embed_models, karena itu yang sesuai dengan apa yang benar-benar
+    # "dilihat" model.
+    orig_bilstm = _original_sequence([text], tokenizers["bilstm"], MAX_LEN_BILSTM)
+    orig_gru    = _original_sequence([text], tokenizers["gru"],    MAX_LEN_GRU)
+    orig_cnn    = _original_sequence([text], tokenizers["cnn"],    MAX_LEN_CNN)
+
+    # OPSI 1 fix: explainer jalan di ruang embedding (float), bukan di index
+    # integer mentah — makanya pad_* diubah dulu jadi vektor embedding lewat
+    # embed_models sebelum dilempar ke shap_values(). Hasilnya berbentuk
+    # (seq_len, embedding_dim) per sampel, jadi perlu di-sum di axis terakhir
+    # untuk dapat satu skor per posisi token (skor kontribusi token itu =
+    # total kontribusi semua dimensi vektor embedding-nya).
+    emb_bilstm = embed_models["bilstm"].predict(pad_bilstm, verbose=0)
+    sv_bilstm = _squeeze_shap_output(explainers["bilstm"].shap_values(_dup(emb_bilstm), nsamples=SHAP_NSAMPLES))[0]
+    sv_bilstm = sv_bilstm.sum(axis=-1)
+    words_bilstm = _sequence_shap_to_words(sv_bilstm, orig_bilstm, index_to_word["bilstm"])
+
+    emb_gru = embed_models["gru"].predict(pad_gru, verbose=0)
+    sv_gru = _squeeze_shap_output(explainers["gru"].shap_values(_dup(emb_gru), nsamples=SHAP_NSAMPLES))[0]
+    sv_gru = sv_gru.sum(axis=-1)
+    words_gru = _sequence_shap_to_words(sv_gru, orig_gru, index_to_word["gru"])
+
+    emb_cnn = embed_models["cnn"].predict(pad_cnn, verbose=0)
+    sv_cnn_seq, sv_cnn_tfidf = explainers["cnn"].shap_values([_dup(emb_cnn), _dup(tfidf_feat)], nsamples=SHAP_NSAMPLES)
+    sv_cnn_seq   = _squeeze_shap_output(sv_cnn_seq)[0]
+    sv_cnn_seq   = sv_cnn_seq.sum(axis=-1)
+    sv_cnn_tfidf = _squeeze_shap_output(sv_cnn_tfidf)[0]
+
+    words_cnn_seq   = _sequence_shap_to_words(sv_cnn_seq, orig_cnn, index_to_word["cnn"])
+    words_cnn_tfidf = _tfidf_shap_to_words(sv_cnn_tfidf, tfidf_feat.flatten(), app_state["tfidf_feature_names"])
+
+    words_cnn: dict[str, float] = defaultdict(float)
+    for w, s in words_cnn_seq.items():
+        words_cnn[w] += s
+    for w, s in words_cnn_tfidf.items():
+        words_cnn[w] += s
+
+    totals: dict[str, float] = defaultdict(float)
+    counts: dict[str, int] = defaultdict(int)
+    for words in (words_bilstm, words_gru, words_cnn):
+        for w, s in words.items():
+            totals[w] += s
+            counts[w] += 1
+
+    merged_scores = {w: totals[w] / counts[w] for w in totals}
+
+    post_embed_models = app_state["post_embed_models"]
+
+    p_bilstm = float(post_embed_models["bilstm"].predict(emb_bilstm, verbose=0).flatten()[0])
+    p_gru    = float(post_embed_models["gru"].predict(emb_gru, verbose=0).flatten()[0])
+    p_cnn    = float(post_embed_models["cnn"].predict([emb_cnn, tfidf_feat], verbose=0).flatten()[0])
+
+    return merged_scores, p_bilstm, p_gru, p_cnn
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -258,3 +641,73 @@ def predict_batch(request: BatchPredictRequest):
         return BatchPredictResponse(results=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/predict/explain", response_model=ExplainResponse, tags=["Explainability"])
+def predict_explain(request: PredictRequest):
+    """
+    OPSI 1 — Prediksi + penjelasan XAI via GradientExplainer per model.
+    Menjalankan SHAP GradientExplainer terpisah untuk bilstm, gru, dan cnn,
+    lalu menggabungkan skor kontribusi kata dari ketiganya. Lebih berat
+    secara komputasi dibanding /predict biasa — cocok dipakai saat pengguna
+    memang minta penjelasan, bukan dipanggil di setiap prediksi.
+    """
+    if not app_state.get("explainers"):
+        raise HTTPException(
+            status_code=503,
+            detail="Explainability belum aktif — background_samples.pkl tidak ditemukan saat startup.",
+        )
+    try:
+        merged_scores, p_bilstm, p_gru, p_cnn = _explain_single(request.text)
+        base_response = _build_response(request.text, p_bilstm, p_gru, p_cnn)
+
+        word_scores = sorted(
+            (WordScore(word=w, score=round(s, 4)) for w, s in merged_scores.items()),
+            key=lambda ws: abs(ws.score),
+            reverse=True,
+        )
+
+        return ExplainResponse(
+            text=request.text,
+            label=base_response.label,
+            confidence=base_response.confidence,
+            word_scores=word_scores,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/debug/vocab-check", response_model=VocabCheckResponse, tags=["Debug"])
+def vocab_check(request: VocabCheckRequest):
+    """
+    Cek apakah suatu kata dikenal (ada di vocabulary) tokenizer sequence
+    dan/atau TF-IDF vectorizer, atau malah OOV (out-of-vocabulary).
+    Berguna untuk investigasi kenapa suatu kata dapat skor SHAP yang
+    janggal/tidak sesuai intuisi — kalau in_vocab=False, kata itu tidak
+    pernah "dilihat" model dengan bentuk aslinya saat training.
+
+    Menampilkan hasil untuk KEDUA tokenizer terpisah (bilstm vs gru/cnn),
+    supaya kelihatan langsung kalau index-nya berbeda antar model — ini yang
+    dulu jadi akar penyebab bias prediksi bilstm ke HOAKS.
+    """
+    tokenizer_bilstm = app_state["tokenizers"]["bilstm"]
+    tokenizer_gru_cnn = app_state["tokenizers"]["gru"]  # sama dgn ["cnn"]
+
+    results = []
+    for word in request.words:
+        word_lower = word.lower()
+        tok_idx_bilstm = tokenizer_bilstm.word_index.get(word_lower)
+        tok_idx_gru_cnn = tokenizer_gru_cnn.word_index.get(word_lower)
+        tfidf_idx = app_state["tfidf"].vocabulary_.get(word_lower)
+
+        results.append(VocabCheckResult(
+            word=word,
+            word_lower=word_lower,
+            in_vocab_bilstm=tok_idx_bilstm is not None,
+            in_vocab_gru_cnn=tok_idx_gru_cnn is not None,
+            tokenizer_index_bilstm=tok_idx_bilstm,
+            tokenizer_index_gru_cnn=tok_idx_gru_cnn,
+            tfidf_index=tfidf_idx,
+        ))
+
+    return VocabCheckResponse(results=results)

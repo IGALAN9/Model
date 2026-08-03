@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+.vscode/
+bruno/
+src/logs/
+src/Notebooks/
+*.ipynb
+*.jpeg
+*.png
+.git/
