@@ -6,12 +6,19 @@ import pickle
 import os
 import shap  
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["ABSL_LOGGING_MIN_LOG_LEVEL"] = "3"
 
 import tensorflow as tf
+# Batasi thread internal TF per operasi, supaya 3 model yang dijalankan
+# paralel (lihat ThreadPoolExecutor di _explain_single) tidak saling
+# rebutan seluruh core CPU — biar paralelisasi level model yang jalan,
+# bukan diserap habis oleh intra-op parallelism TF sendiri.
+tf.config.threading.set_intra_op_parallelism_threads(2)
+tf.config.threading.set_inter_op_parallelism_threads(3)
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras import layers, regularizers
 
@@ -266,6 +273,7 @@ async def lifespan(app: FastAPI):
 
     app_state["explainers"] = {}
     app_state["embed_models"] = {}
+    app_state["executor"] = ThreadPoolExecutor(max_workers=3)
     app_state["post_embed_models"] = {}
     if os.path.exists(BACKGROUND_PATH):
         with open(BACKGROUND_PATH, "rb") as f:
@@ -315,6 +323,7 @@ async def lifespan(app: FastAPI):
         print(f"⚠️  Background samples tidak ditemukan di {BACKGROUND_PATH} — /predict/explain nonaktif.")
 
     yield
+    app_state["executor"].shutdown(wait=True)
     app_state.clear()
     VOCAB_SIZE.clear()
 
@@ -411,6 +420,23 @@ class VocabCheckResult(BaseModel):
 class VocabCheckResponse(BaseModel):
     results: list[VocabCheckResult]
 
+
+class RawScoresResponse(BaseModel):
+    text:             str
+    p_bilstm:         float
+    p_gru:            float
+    p_cnn:            float
+    avg:              float   # rata-rata ketiga model, ini yang dibandingkan ke THRESHOLD
+    threshold:        float
+    would_be_hoaks:   bool    # avg >= threshold (logika sama persis dgn _build_response)
+    gap_to_threshold: float   # avg - threshold; negatif = masih di bawah ambang HOAKS
+    note: str = (
+        "avg dihitung dgn np.mean([p_bilstm, p_gru, p_cnn]) — SAMA PERSIS dgn "
+        "_build_response(). Kalau avg < threshold walau p_bilstm/p_gru/p_cnn "
+        "semua > 0.5 (condong HOAKS), label akhir tetap FAKTA karena threshold "
+        "0.80 belum tercapai — ini beda dari kasus modelnya salah baca teks."
+    )
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def _pad(texts: list[str], tokenizer, maxlen: int, vocab_size: int) -> np.ndarray:
     """Tokenize (pakai tokenizer MILIK MODEL yang bersangkutan — lihat
@@ -500,7 +526,7 @@ def _sequence_shap_to_words(shap_vals_seq: np.ndarray, padded_seq: np.ndarray, i
         if token_index == 0:
             continue
         word = index_to_word.get(int(token_index))
-        if word is None:
+        if word is None or word == "<OOV>":
             continue
         scores[word] = scores.get(word, 0.0) + float(score)
     return scores
@@ -529,52 +555,59 @@ def _tfidf_shap_to_words(
         scores[word] = scores.get(word, 0.0) + float(shap_vals_tfidf[i])
     return scores
 
+def _explain_bilstm(text: str) -> tuple[dict[str, float], float]:
+    tokenizers        = app_state["tokenizers"]
+    embed_models       = app_state["embed_models"]
+    post_embed_models  = app_state["post_embed_models"]
+    index_to_word      = app_state["index_to_word"]
 
-def _explain_single(text: str) -> tuple[dict[str, float], float, float, float]:
-    """Jalankan GradientExplainer untuk ketiga model, gabungkan (rata-rata) skor kata lintas model."""
-    explainers = app_state["explainers"]
-    if not explainers:
-        raise RuntimeError("GradientExplainer belum siap — background_samples.pkl tidak ditemukan saat startup.")
-
-    tokenizers     = app_state["tokenizers"]
-    index_to_word  = app_state["index_to_word"]  # sekarang dict per model: index_to_word["bilstm"], dst.
-    embed_models   = app_state["embed_models"]
-
-    pad_bilstm = _pad([text], tokenizers["bilstm"], MAX_LEN_BILSTM, VOCAB_SIZE["bilstm"])
-    pad_gru    = _pad([text], tokenizers["gru"],    MAX_LEN_GRU,    VOCAB_SIZE["gru"])
-    pad_cnn    = _pad([text], tokenizers["cnn"],    MAX_LEN_CNN,    VOCAB_SIZE["cnn"])
-    tfidf_feat = _tfidf([text])
-
-    # Sequence ASLI (tanpa clip vocab_size) — dipakai KHUSUS untuk translate
-    # index->kata yang benar, pakai tokenizer masing-masing model (bilstm
-    # tokenizernya beda dari gru/cnn — lihat catatan root cause di atas).
-    # pad_bilstm/pad_gru/pad_cnn (yang sudah di-clip) tetap dipakai untuk feed
-    # ke embed_models, karena itu yang sesuai dengan apa yang benar-benar
-    # "dilihat" model.
+    pad_bilstm  = _pad([text], tokenizers["bilstm"], MAX_LEN_BILSTM, VOCAB_SIZE["bilstm"])
     orig_bilstm = _original_sequence([text], tokenizers["bilstm"], MAX_LEN_BILSTM)
-    orig_gru    = _original_sequence([text], tokenizers["gru"],    MAX_LEN_GRU)
-    orig_cnn    = _original_sequence([text], tokenizers["cnn"],    MAX_LEN_CNN)
 
-    # OPSI 1 fix: explainer jalan di ruang embedding (float), bukan di index
-    # integer mentah — makanya pad_* diubah dulu jadi vektor embedding lewat
-    # embed_models sebelum dilempar ke shap_values(). Hasilnya berbentuk
-    # (seq_len, embedding_dim) per sampel, jadi perlu di-sum di axis terakhir
-    # untuk dapat satu skor per posisi token (skor kontribusi token itu =
-    # total kontribusi semua dimensi vektor embedding-nya).
     emb_bilstm = embed_models["bilstm"].predict(pad_bilstm, verbose=0)
-    sv_bilstm = _squeeze_shap_output(explainers["bilstm"].shap_values(_dup(emb_bilstm), nsamples=SHAP_NSAMPLES))[0]
+    sv_bilstm = _squeeze_shap_output(
+        app_state["explainers"]["bilstm"].shap_values(_dup(emb_bilstm), nsamples=SHAP_NSAMPLES)
+    )[0]
     sv_bilstm = sv_bilstm.sum(axis=-1)
     words_bilstm = _sequence_shap_to_words(sv_bilstm, orig_bilstm, index_to_word["bilstm"])
+    p_bilstm = float(post_embed_models["bilstm"].predict(emb_bilstm, verbose=0).flatten()[0])
+    return words_bilstm, p_bilstm
+
+
+def _explain_gru(text: str) -> tuple[dict[str, float], float]:
+    tokenizers        = app_state["tokenizers"]
+    embed_models       = app_state["embed_models"]
+    post_embed_models  = app_state["post_embed_models"]
+    index_to_word      = app_state["index_to_word"]
+
+    pad_gru  = _pad([text], tokenizers["gru"], MAX_LEN_GRU, VOCAB_SIZE["gru"])
+    orig_gru = _original_sequence([text], tokenizers["gru"], MAX_LEN_GRU)
 
     emb_gru = embed_models["gru"].predict(pad_gru, verbose=0)
-    sv_gru = _squeeze_shap_output(explainers["gru"].shap_values(_dup(emb_gru), nsamples=SHAP_NSAMPLES))[0]
+    sv_gru = _squeeze_shap_output(
+        app_state["explainers"]["gru"].shap_values(_dup(emb_gru), nsamples=SHAP_NSAMPLES)
+    )[0]
     sv_gru = sv_gru.sum(axis=-1)
     words_gru = _sequence_shap_to_words(sv_gru, orig_gru, index_to_word["gru"])
+    p_gru = float(post_embed_models["gru"].predict(emb_gru, verbose=0).flatten()[0])
+    return words_gru, p_gru
+
+
+def _explain_cnn(text: str) -> tuple[dict[str, float], float]:
+    tokenizers        = app_state["tokenizers"]
+    embed_models       = app_state["embed_models"]
+    post_embed_models  = app_state["post_embed_models"]
+    index_to_word      = app_state["index_to_word"]
+
+    pad_cnn    = _pad([text], tokenizers["cnn"], MAX_LEN_CNN, VOCAB_SIZE["cnn"])
+    orig_cnn   = _original_sequence([text], tokenizers["cnn"], MAX_LEN_CNN)
+    tfidf_feat = _tfidf([text])
 
     emb_cnn = embed_models["cnn"].predict(pad_cnn, verbose=0)
-    sv_cnn_seq, sv_cnn_tfidf = explainers["cnn"].shap_values([_dup(emb_cnn), _dup(tfidf_feat)], nsamples=SHAP_NSAMPLES)
-    sv_cnn_seq   = _squeeze_shap_output(sv_cnn_seq)[0]
-    sv_cnn_seq   = sv_cnn_seq.sum(axis=-1)
+    sv_cnn_seq, sv_cnn_tfidf = app_state["explainers"]["cnn"].shap_values(
+        [_dup(emb_cnn), _dup(tfidf_feat)], nsamples=SHAP_NSAMPLES
+    )
+    sv_cnn_seq   = _squeeze_shap_output(sv_cnn_seq)[0].sum(axis=-1)
     sv_cnn_tfidf = _squeeze_shap_output(sv_cnn_tfidf)[0]
 
     words_cnn_seq   = _sequence_shap_to_words(sv_cnn_seq, orig_cnn, index_to_word["cnn"])
@@ -586,20 +619,29 @@ def _explain_single(text: str) -> tuple[dict[str, float], float, float, float]:
     for w, s in words_cnn_tfidf.items():
         words_cnn[w] += s
 
+    p_cnn = float(post_embed_models["cnn"].predict([emb_cnn, tfidf_feat], verbose=0).flatten()[0])
+    return dict(words_cnn), p_cnn
+
+def _explain_single(text: str) -> tuple[dict[str, float], float, float, float]:
+    if not app_state["explainers"]:
+        raise RuntimeError("GradientExplainer belum siap — background_samples.pkl tidak ditemukan saat startup.")
+
+    executor = app_state["executor"]
+    future_bilstm = executor.submit(_explain_bilstm, text)
+    future_gru    = executor.submit(_explain_gru, text)
+    future_cnn    = executor.submit(_explain_cnn, text)
+
+    words_bilstm, p_bilstm = future_bilstm.result()
+    words_gru, p_gru       = future_gru.result()
+    words_cnn, p_cnn       = future_cnn.result()
+
     totals: dict[str, float] = defaultdict(float)
     counts: dict[str, int] = defaultdict(int)
     for words in (words_bilstm, words_gru, words_cnn):
         for w, s in words.items():
             totals[w] += s
             counts[w] += 1
-
     merged_scores = {w: totals[w] / counts[w] for w in totals}
-
-    post_embed_models = app_state["post_embed_models"]
-
-    p_bilstm = float(post_embed_models["bilstm"].predict(emb_bilstm, verbose=0).flatten()[0])
-    p_gru    = float(post_embed_models["gru"].predict(emb_gru, verbose=0).flatten()[0])
-    p_cnn    = float(post_embed_models["cnn"].predict([emb_cnn, tfidf_feat], verbose=0).flatten()[0])
 
     return merged_scores, p_bilstm, p_gru, p_cnn
 
@@ -672,6 +714,36 @@ def predict_explain(request: PredictRequest):
             label=base_response.label,
             confidence=base_response.confidence,
             word_scores=word_scores,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/debug/raw-scores", response_model=RawScoresResponse, tags=["Debug"])
+def raw_scores(request: PredictRequest):
+    """
+    Kembalikan probabilitas MENTAH dari ketiga model (bilstm, gru, cnn) TANPA
+    melewati THRESHOLD final — supaya kelihatan beda antara dua kasus yang
+    gejalanya sama-sama "kelabel FAKTA" tapi akar masalahnya beda:
+      1) Model memang salah baca teks (avg rendah, jauh di bawah 0.5) →
+         indikasi model tidak mengenali pola/kata dalam teks tsb.
+      2) Model sebenarnya condong ke HOAKS (avg > 0.5) tapi belum tembus
+         THRESHOLD 0.80 → bukan model yang "buta", tapi ambang batasnya yang
+         ketat. Kalau ini yang terjadi, evaluasi ulang apakah THRESHOLD=0.80
+         memang disengaja atau perlu diturunkan.
+    """
+    try:
+        p_bilstm, p_gru, p_cnn = _predict_single(request.text)
+        avg = float(np.mean([p_bilstm, p_gru, p_cnn]))
+        return RawScoresResponse(
+            text=request.text,
+            p_bilstm=round(p_bilstm, 4),
+            p_gru=round(p_gru, 4),
+            p_cnn=round(p_cnn, 4),
+            avg=round(avg, 4),
+            threshold=THRESHOLD,
+            would_be_hoaks=avg >= THRESHOLD,
+            gap_to_threshold=round(avg - THRESHOLD, 4),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
