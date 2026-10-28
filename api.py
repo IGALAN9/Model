@@ -394,7 +394,7 @@ class ExplainResponse(BaseModel):
     text:        str
     label:       str
     confidence:  float
-    word_scores: list[WordScore]  # sudah digabung dari ketiga model, diurutkan dari kontribusi terbesar
+    word_scores: list[WordScore]  
 
 
 class VocabCheckRequest(BaseModel):
